@@ -10,10 +10,14 @@ on:
 
 jobs:
   apple:
-    runs-on: macos-15
+    # Intel image: arm64 macOS capacity left the first run unscheduled
+    # ("not acquired by Runner of type hosted"). macos-15-intel ships
+    # Xcode 26.0.1-26.3 with the watchOS/iOS 26 SDKs, and lets the Makefile
+    # build the x86_64 slice at the real 10.14 Mojave deployment target.
+    runs-on: macos-15-intel
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Select Xcode 26
         run: |
@@ -63,7 +67,7 @@ jobs:
 
       - name: Upload build logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: apple-build-logs
           path: "*.log"
@@ -73,6 +77,6 @@ jobs:
     container: swift:6.0.3-jammy
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Linux harness (shared core, tester core, interop vectors)
         run: bash Tests/Linux/build.sh
