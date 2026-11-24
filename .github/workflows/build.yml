@@ -28,9 +28,12 @@ jobs:
 
       - name: Ensure watchOS / iOS platforms are present
         run: |
-          xcodebuild -showsdks
-          xcodebuild -downloadPlatform watchOS || true
-          xcodebuild -downloadPlatform iOS || true
+          # Device builds (generic/platform=...) only need the SDKs that ship
+          # inside Xcode; simulator runtimes are multi-GB, so download a
+          # platform only if its device SDK is genuinely missing.
+          xcodebuild -showsdks | tee sdks.txt
+          grep -q -- "-sdk watchos" sdks.txt || xcodebuild -downloadPlatform watchOS
+          grep -q -- "-sdk iphoneos" sdks.txt || xcodebuild -downloadPlatform iOS
 
       - name: Install XcodeGen
         run: brew install xcodegen
