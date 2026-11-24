@@ -1,0 +1,5 @@
+module CMonocypher {
+    header "shim.h"
+    link "monocypher"
+    export *
+}

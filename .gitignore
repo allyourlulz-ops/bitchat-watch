@@ -1,0 +1,15 @@
+# generated
+BitchatWatch.xcodeproj/
+*.xcworkspace/
+DerivedData/
+build/
+MacTester/build/
+*.o
+*.a
+*.log
+.DS_Store
+xcuserdata/
+# local reference checkouts (not distributed)
+upstream/
+ref/
+wear-plan.md

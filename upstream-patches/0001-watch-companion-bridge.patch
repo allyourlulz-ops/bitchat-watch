@@ -1,0 +1,1728 @@
+diff --git a/bitchat/App/AppRuntime.swift b/bitchat/App/AppRuntime.swift
+index 3d5bc5b..f2f6567 100644
+--- a/bitchat/App/AppRuntime.swift
++++ b/bitchat/App/AppRuntime.swift
+@@ -32,6 +32,10 @@ final class AppRuntime: ObservableObject {
+     private let idBridge: NostrIdentityBridge
+     private var cancellables = Set<AnyCancellable>()
+     private var started = false
++    #if os(iOS)
++    /// bitchat-watch companion bridge (WatchConnectivity + local channel chat).
++    private var watchBridgeAdapter: BitchatWatchBridgeAdapter?
++    #endif
+     private var lastNostrRelayConnectedState = false
+     private var didHandleInitialNostrConnection = false
+ 
+@@ -134,6 +138,11 @@ final class AppRuntime: ObservableObject {
+         }
+ 
+         started = true
++        #if os(iOS)
++        let watchBridge = BitchatWatchBridgeAdapter(chatViewModel: chatViewModel)
++        watchBridgeAdapter = watchBridge
++        watchBridge.start()
++        #endif
+         NotificationDelegate.shared.runtime = self
+         VerificationService.shared.configure(with: chatViewModel.meshService)
+         announceInitialTorStatusIfNeeded()
+diff --git a/bitchat/Info.plist b/bitchat/Info.plist
+index 57ddfa1..1e8310b 100644
+--- a/bitchat/Info.plist
++++ b/bitchat/Info.plist
+@@ -39,6 +39,14 @@
+ 	<string>bitchat uses Bluetooth to create a secure mesh network for chatting with nearby users.</string>
+ 	<key>NSBluetoothPeripheralUsageDescription</key>
+ 	<string>bitchat uses Bluetooth to discover and connect with other bitchat users nearby.</string>
++	<key>NSBonjourServices</key>
++	<array>
++		<string>_hkchan._tcp</string>
++		<string>_hk-chan._tcp</string>
++		<string>_hk-chan._udp</string>
++	</array>
++	<key>NSLocalNetworkUsageDescription</key>
++	<string>bitchat uses the local network for offline channel chat with nearby devices and to reach your Apple Watch.</string>
+ 	<key>NSCameraUsageDescription</key>
+ 	<string>bitchat uses the camera to scan QR codes to verify peers.</string>
+ 	<key>NSLocationWhenInUseUsageDescription</key>
+diff --git a/bitchat/Services/BLE/BLEService.swift b/bitchat/Services/BLE/BLEService.swift
+index a07e5d3..4eab7f7 100644
+--- a/bitchat/Services/BLE/BLEService.swift
++++ b/bitchat/Services/BLE/BLEService.swift
+@@ -362,6 +362,9 @@ final class BLEService: NSObject {
+     private let keychain: KeychainManagerProtocol
+     private let idBridge: NostrIdentityBridge
+     private let localIdentityState = BLELocalIdentityStateStore()
++    /// bitchat-watch: observer for packet types this build doesn't understand
++    /// (called on the engine queue for every unknown type, before relay).
++    var opaquePacketObserver: ((UInt8, Data, PeerID) -> Void)?
+ 
+     // MARK: - Advertising Privacy
+     // No Local Name by default for maximum privacy. No rotating alias.
+@@ -2941,6 +2944,24 @@ extension BLEService: GossipSyncManager.Delegate {
+         }
+     }
+ 
++    /// bitchat-watch: broadcast an unsigned opaque payload of a non-core type
++    /// (used by the watch companion's channel-chat bridge, type 0x7E).
++    func broadcastOpaque(type: UInt8, payload: Data, ttl: UInt8) {
++        guard MessageType(rawValue: type) == nil else { return } // never forge core types
++        onEngine {
++            let packet = BitchatPacket(
++                type: type,
++                senderID: myPeerIDData,
++                recipientID: nil,
++                timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
++                payload: payload,
++                signature: nil,
++                ttl: min(ttl, messageTTL)
++            )
++            broadcastPacket(packet)
++        }
++    }
++
+     func sendPacket(to peerID: PeerID, packet: BitchatPacket) {
+         onEngine {
+             _ = sendPacketDirected(packet, to: peerID)
+@@ -6045,6 +6066,9 @@ extension BLEService {
+ 
+         case .none:
+             SecureLogger.warning("⚠️ Unknown message type: \(packet.type)", category: .session)
++            // bitchat-watch: surface opaque types (e.g. 0x7E channel tunnel) to an observer;
++            // relaying below is unchanged.
++            opaquePacketObserver?(packet.type, packet.payload, senderID)
+         }
+         
+         if forwardAlongRouteIfNeeded(packet) {
+diff --git a/bitchat/ViewModels/ChatOutgoingCoordinator.swift b/bitchat/ViewModels/ChatOutgoingCoordinator.swift
+index 1bb3e21..7ebde0a 100644
+--- a/bitchat/ViewModels/ChatOutgoingCoordinator.swift
++++ b/bitchat/ViewModels/ChatOutgoingCoordinator.swift
+@@ -123,6 +123,13 @@ final class ChatOutgoingCoordinator {
+         }
+     }
+ 
++    /// bitchat-watch: send text to the mesh channel regardless of the active channel.
++    func sendMeshText(_ text: String) {
++        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
++        guard !trimmed.isEmpty else { return }
++        sendMeshPublicMessage(originalContent: trimmed, trimmed: trimmed, mentions: [])
++    }
++
+     /// Broadcasts a wave on the mesh channel regardless of the active channel —
+     /// used by the "bitchatters nearby" notification quick action, which always
+     /// refers to mesh peers.
+diff --git a/bitchat/ViewModels/ChatViewModel.swift b/bitchat/ViewModels/ChatViewModel.swift
+index 36742d2..3af2f06 100644
+--- a/bitchat/ViewModels/ChatViewModel.swift
++++ b/bitchat/ViewModels/ChatViewModel.swift
+@@ -1315,6 +1315,12 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, SynchronousMessage
+         outgoingCoordinator.sendMessage(content)
+     }
+ 
++    /// bitchat-watch: send text to the mesh channel regardless of the active channel.
++    @MainActor
++    func sendMeshText(_ text: String) {
++        outgoingCoordinator.sendMeshText(text)
++    }
++
+     /// Sends a 👋 to the mesh channel regardless of the active channel.
+     @MainActor
+     func sendMeshWave() {
+diff --git a/bitchat/WatchBridge/BitchatWatchBridgeAdapter.swift b/bitchat/WatchBridge/BitchatWatchBridgeAdapter.swift
+new file mode 100644
+index 0000000..26cab88
+--- /dev/null
++++ b/bitchat/WatchBridge/BitchatWatchBridgeAdapter.swift
+@@ -0,0 +1,114 @@
++//
++// BitchatWatchBridgeAdapter.swift — goes INTO the upstream bitchat iOS app
++// (bitchat/WatchBridge/), added by upstream-patches/0001-watch-companion-bridge.patch.
++//
++// Adapts upstream ChatViewModel / ConversationStore / BLEService to the
++// WatchBridgeKit package's public façade. Depends on three small additive
++// upstream changes made by the same patch:
++//   * ChatViewModel.sendMeshText(_:)          (mesh public send regardless of active channel)
++//   * BLEService.broadcastOpaque(type:payload:ttl:)
++//   * BLEService.opaquePacketObserver          (called for unknown packet types, before relay)
++//
++// Written against upstream commit 04995f68 (2026-10-25). UNCOMPILED in this
++// repo (needs the upstream tree + Xcode); see README.
++//
++// SPDX-License-Identifier: GPL-3.0-or-later
++//
++
++#if os(iOS)
++import BitFoundation
++import Combine
++import Foundation
++import WatchBridgeKit
++
++@MainActor
++final class BitchatWatchBridgeAdapter: WatchBridgeChatSource {
++    private let vm: ChatViewModel
++    private var bridge: WatchBridge?
++    private var bag = Set<AnyCancellable>()
++
++    init(chatViewModel: ChatViewModel) {
++        vm = chatViewModel
++    }
++
++    func start() {
++        let b = WatchBridge(source: self)
++        bridge = b
++        vm.conversations.changes
++            .receive(on: DispatchQueue.main)
++            .sink { [weak self] change in
++                guard let self = self, case .appended(let cid, let msg) = change, let wb = self.convert(msg, in: cid) else { return }
++                self.bridge?.didReceive(wb)
++            }
++            .store(in: &bag)
++        vm.$allPeers
++            .receive(on: DispatchQueue.main)
++            .sink { [weak self] _ in self?.bridge?.peopleDidChange() }
++            .store(in: &bag)
++        if let ble = vm.meshService as? BLEService {
++            ble.opaquePacketObserver = { [weak self] type, payload, sender in
++                guard type == WatchBridge.tunnelPacketType else { return }
++                Task { @MainActor in self?.bridge?.didReceiveTunnel(payload, fromPeer: sender.id) }
++            }
++        }
++        b.start()
++    }
++
++    // MARK: WatchBridgeChatSource
++
++    var bridgeNickname: String { vm.nickname }
++
++    var bridgePeople: [WBPerson] {
++        vm.allPeers.map {
++            WBPerson(key: $0.peerID.id, name: $0.displayName, detail: $0.isConnected ? "connected" : ($0.isReachable ? "reachable" : "offline"),
++                     online: $0.isConnected || $0.isReachable, favorite: $0.isFavorite, secure: false)
++        }
++    }
++
++    var bridgeRecentMessages: [WBMessage] {
++        let mesh = vm.conversations.conversationsByID[.mesh]?.messages.suffix(30) ?? []
++        return mesh.compactMap { convert($0, in: .mesh) }
++    }
++
++    func bridgeSendPublic(_ text: String) -> WBMessage? {
++        vm.sendMeshText(text)
++        return WBMessage(id: UUID().uuidString, directPeerKey: nil, senderName: vm.nickname, senderKey: vm.meshService.myPeerID.id,
++                         text: text, timestamp: Date(), outgoing: true, state: .sent)
++    }
++
++    func bridgeSendPrivate(_ text: String, peerKey: String) -> WBMessage? {
++        vm.privateConversationCoordinator.sendPrivateMessage(text, to: PeerID(str: peerKey))
++        return WBMessage(id: UUID().uuidString, directPeerKey: peerKey, senderName: vm.nickname, senderKey: vm.meshService.myPeerID.id,
++                         text: text, timestamp: Date(), outgoing: true, state: .sending)
++    }
++
++    func bridgeToggleFavorite(peerKey: String) { vm.toggleFavorite(peerID: PeerID(str: peerKey)) }
++
++    var bridgeTunnelSend: ((Data, UInt8) -> Void)? {
++        guard let ble = vm.meshService as? BLEService else { return nil }
++        return { payload, ttl in ble.broadcastOpaque(type: WatchBridge.tunnelPacketType, payload: payload, ttl: ttl) }
++    }
++
++    // MARK: helpers
++
++    private func convert(_ m: BitchatMessage, in cid: ConversationID) -> WBMessage? {
++        let directKey: String?
++        switch cid {
++        case .mesh: directKey = nil
++        case .direct(let handle): directKey = handle.routingPeerID.id
++        case .geohash: return nil   // location channels are internet (Nostr); out of watch scope
++        }
++        let mine = m.senderPeerID == vm.meshService.myPeerID
++        let state: WBMessage.State
++        switch m.deliveryStatus {
++        case .delivered: state = .delivered
++        case .read: state = .read
++        case .failed: state = .failed
++        case .sending: state = .sending
++        default: state = mine ? .sent : .received
++        }
++        return WBMessage(id: m.id, directPeerKey: directKey, senderName: m.sender, senderKey: m.senderPeerID?.id ?? "",
++                         text: m.content, timestamp: m.timestamp, outgoing: mine, state: state)
++    }
++}
++#endif
+diff --git a/localPackages/WatchBridgeKit/Package.swift b/localPackages/WatchBridgeKit/Package.swift
+new file mode 100644
+index 0000000..5ea1e3f
+--- /dev/null
++++ b/localPackages/WatchBridgeKit/Package.swift
+@@ -0,0 +1,11 @@
++// swift-tools-version: 5.9
++// WatchBridgeKit — Apple Watch companion bridge + local channel chat for bitchat iOS.
++// GPL-3.0-or-later (see LICENSE/NOTICE in bitchat-watch). Internal copies of
++// bitchat-watch Shared/ code; only WatchBridgePublic.swift is public.
++import PackageDescription
++let package = Package(
++    name: "WatchBridgeKit",
++    platforms: [.iOS(.v16), .macOS(.v13)],
++    products: [.library(name: "WatchBridgeKit", targets: ["WatchBridgeKit"])],
++    targets: [.target(name: "WatchBridgeKit", path: "Sources/WatchBridgeKit")]
++)
+diff --git a/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/ChannelChatService.swift b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/ChannelChatService.swift
+new file mode 100644
+index 0000000..42686d2
+--- /dev/null
++++ b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/ChannelChatService.swift
+@@ -0,0 +1,121 @@
++//
++// ChannelChatService.swift — bitchat-watch iPhone companion
++//
++// Local "channel chat" peer + bridge. Owns one ChannelRouter and three paths:
++//   LAN (Bonjour/TCP), MultipeerConnectivity, and — opt-in per channel — the
++//   bitchat BLE mesh, via an opaque tunnel packet (type 0x7E) that stock
++//   bitchat iOS/Android relay without understanding (docs/wifi-channel.md §6).
++// Joined channels are persisted (code + bridge flag) in UserDefaults: the
++// code is a weak shared secret by design, see the doc.
++//
++// SPDX-License-Identifier: GPL-3.0-or-later
++//
++
++import Foundation
++
++@MainActor
++final class ChannelChatService {
++    let router: ChannelRouter
++    let lan = LANChannelTransport()
++    let mpc = MPCChannelTransport()
++    /// Set by the bitchat side when it can carry tunnel packets (patched upstream
++    /// BLEService or the host app's leaf engine). nil = bridging unavailable.
++    var bitchatTunnelSend: ((Data, UInt8) -> Void)? { didSet { onChange() } }
++
++    var onMessage: (UnifiedMessage) -> Void = { _ in }
++    var onChange: () -> Void = {}
++    private(set) var lanPeers = 0
++    private(set) var mpcPeers = 0
++    private let defaultsKey = "hk.channels.v1"
++
++    init(nickname: String) {
++        var g = SystemRandomNumberGenerator()
++        let origin = Data((0..<8).map { _ in UInt8.random(in: 0...255, using: &g) })
++        router = ChannelRouter(originID: origin, nickname: nickname)
++        router.transmit = { [weak self] env, path, except in
++            guard let self = self else { return }
++            switch path {
++            case .lan: self.lan.send(env, except: except?.path == .lan ? except?.id : nil)
++            case .mpc: self.mpc.send(env, except: except?.path == .mpc ? except?.id : nil)
++            case .bitchat:
++                if let h = ChannelEnvelopeHeader.parse(env) { self.bitchatTunnelSend?(env, h.ttl) }
++            }
++        }
++        router.onEvent = { [weak self] e in
++            guard let self = self, case .message(let m, _, let via, let bridged) = e else { return }
++            switch m.kind {
++            case .text:
++                self.onMessage(UnifiedMessage(id: m.msgID.hexEncodedString(), conversation: .room(.channel, m.channelID.hexEncodedString()),
++                    senderName: m.nickname, senderKey: m.originID.hexEncodedString(), text: m.body,
++                    timestamp: Date(timeIntervalSince1970: Double(m.timestampMs) / 1000), outgoing: false, state: .received,
++                    bridged: bridged, via: via.rawValue.uppercased()))
++            case .hello, .leave:
++                self.onChange()
++            }
++        }
++        lan.onEnvelope = { [weak self] env, link in self?.router.ingest(env, from: ChannelLinkRef(path: .lan, id: link)) }
++        mpc.onEnvelope = { [weak self] env, link in self?.router.ingest(env, from: ChannelLinkRef(path: .mpc, id: link)) }
++        lan.onPeersChanged = { [weak self] n in self?.lanPeers = n; self?.onChange() }
++        mpc.onPeersChanged = { [weak self] n in self?.mpcPeers = n; self?.onChange() }
++        restore()
++    }
++
++    /// Envelope that arrived inside a bitchat tunnel packet.
++    func ingestFromBitchat(_ envelope: Data, from peer: String) {
++        router.ingest(envelope, from: ChannelLinkRef(path: .bitchat, id: peer))
++    }
++
++    @discardableResult
++    func join(code: String, bridge: Bool) -> RoomInfo? {
++        guard let keys = router.join(code: code, bridge: bridge && bitchatTunnelSend != nil) else { return nil }
++        persist()
++        refreshAdvertising()
++        router.sendHello(channelID: keys.channelID)
++        return room(for: keys.channelID)
++    }
++
++    func leave(idHex: String) {
++        guard let id = Data(hexString: idHex) else { return }
++        router.leave(channelID: id)
++        persist(); refreshAdvertising()
++    }
++
++    func setBridge(idHex: String, enabled: Bool) {
++        guard let id = Data(hexString: idHex) else { return }
++        router.setBridge(enabled && bitchatTunnelSend != nil, channelID: id)
++        persist(); onChange()
++    }
++
++    func send(_ text: String, idHex: String) -> UnifiedMessage? {
++        guard let id = Data(hexString: idHex), let m = router.send(text: text, channelID: id) else { return nil }
++        return UnifiedMessage(id: m.msgID.hexEncodedString(), conversation: .room(.channel, idHex), senderName: router.nickname,
++                              senderKey: router.originID.hexEncodedString(), text: text, timestamp: Date(), outgoing: true,
++                              state: .sent, bridged: router.memberships[id]?.bridgeToBitchat ?? false)
++    }
++
++    var rooms: [RoomInfo] { router.memberships.keys.compactMap { room(for: $0) } }
++
++    private func room(for id: Data) -> RoomInfo? {
++        guard let m = router.memberships[id] else { return nil }
++        return RoomInfo(conversation: .room(.channel, id.hexEncodedString()), title: m.displayName,
++                        bridged: m.bridgeToBitchat, memberCount: lanPeers + mpcPeers)
++    }
++
++    private func refreshAdvertising() {
++        let ids = router.advertisedChannelIDs
++        lan.update(channelIDs: ids)
++        mpc.update(channelIDs: ids)
++        onChange()
++    }
++
++    private func persist() {
++        let list = router.memberships.values.map { ["code": $0.keys.code, "bridge": $0.bridgeToBitchat ? "1" : "0"] }
++        UserDefaults.standard.set(list, forKey: defaultsKey)
++    }
++
++    private func restore() {
++        let list = UserDefaults.standard.array(forKey: defaultsKey) as? [[String: String]] ?? []
++        for e in list { if let c = e["code"] { router.join(code: c, bridge: e["bridge"] == "1") } }
++        refreshAdvertising()
++    }
++}
+diff --git a/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/ChannelProtocol.swift b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/ChannelProtocol.swift
+new file mode 100644
+index 0000000..728cf5e
+--- /dev/null
++++ b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/ChannelProtocol.swift
+@@ -0,0 +1,179 @@
++//
++// ChannelProtocol.swift — bitchat-watch "channel chat" (our own protocol, v1)
++//
++// Local channel chat keyed by a short shared channel code. Carried over LAN
++// (Bonjour/TCP), MultipeerConnectivity and — opt-in per channel — tunnelled
++// through the bitchat BLE mesh. See docs/wifi-channel.md for the full spec and
++// the security caveats (a short code is a WEAK secret: anyone who can guess or
++// brute-force it can read and post; not for sensitive use).
++//
++// Envelope (all integers big-endian):
++//   0   4  magic "HKC1"
++//   4   1  version = 1
++//   5   1  ttl (hops remaining, default 5, clamped to 7) — NOT authenticated
++//   6   8  channelID = HKDF(code, info "hkchan/v1/id")[0..8]
++//   14 16  msgID (random)
++//   30 12  nonce (random)
++//   42  n  ChaCha20-Poly1305(key, nonce, aad = bytes[0..5) ‖ bytes[6..30)) ciphertext ‖ 16-byte tag
++// Inner plaintext:
++//   originID(8) ‖ timestampMs(8) ‖ kind(1) ‖ nickLen(1) ‖ nick ‖ body
++//
++// SPDX-License-Identifier: GPL-3.0-or-later
++//
++
++import Foundation
++import CryptoKit
++
++enum ChannelTunnelWire {
++    /// bitchat MessageType value used to tunnel channel envelopes through the BLE
++    /// mesh. Unassigned upstream as of bitchat iOS 04995f68 / Android cc1fb178;
++    /// both stock clients relay unknown broadcast types (see docs/wifi-channel.md).
++    static let bitchatPacketType: UInt8 = 0x7E
++    /// Keep tunnelled envelopes inside one BLE write on typical phone links so
++    /// stock relays don't have to fragment an unknown type.
++    static let maxTunnelledEnvelopeBytes = 400
++}
++
++enum ChannelMessageKind: UInt8, Codable {
++    case text = 1
++    case hello = 2   // presence: nickname only, not bridged, ttl 1
++    case leave = 3
++}
++
++struct ChannelKeys: Equatable {
++    let code: String           // normalized
++    let key: SymmetricKey
++    let channelID: Data        // 8 bytes
++    var channelIDHex: String { channelID.hexEncodedString() }
++
++    static let minimumCodeLength = 4
++
++    /// Normalization: NFKC, trim, lowercase, collapse internal whitespace.
++    static func normalize(_ raw: String) -> String {
++        let nfkc = raw.precomposedStringWithCompatibilityMapping
++        return nfkc.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
++            .split(whereSeparator: { $0 == " " || $0 == "\t" }).joined(separator: " ")
++    }
++
++    init?(code raw: String) {
++        let code = ChannelKeys.normalize(raw)
++        guard code.count >= ChannelKeys.minimumCodeLength else { return nil }
++        let ikm = SymmetricKey(data: Data(code.utf8))
++        let salt = Data("hkchan/v1/salt".utf8)
++        self.code = code
++        self.key = HKDF<SHA256>.deriveKey(inputKeyMaterial: ikm, salt: salt, info: Data("hkchan/v1/key".utf8), outputByteCount: 32)
++        self.channelID = HKDF<SHA256>.deriveKey(inputKeyMaterial: ikm, salt: salt, info: Data("hkchan/v1/id".utf8), outputByteCount: 8)
++            .withUnsafeBytes { Data($0) }
++    }
++
++    static func == (a: ChannelKeys, b: ChannelKeys) -> Bool { a.code == b.code }
++}
++
++struct ChannelEnvelopeHeader: Equatable {
++    static let magic: [UInt8] = [0x48, 0x4B, 0x43, 0x31] // "HKC1"
++    static let version: UInt8 = 1
++    static let length = 42
++    static let defaultTTL: UInt8 = 5
++    static let maxTTL: UInt8 = 7
++    static let maxEnvelopeBytes = 4096
++
++    var ttl: UInt8
++    let channelID: Data
++    let msgID: Data
++    let nonce: Data
++
++    var msgIDHex: String { msgID.hexEncodedString() }
++
++    static func parse(_ d: Data) -> ChannelEnvelopeHeader? {
++        guard d.count >= length + 16, d.count <= maxEnvelopeBytes else { return nil }
++        let b = [UInt8](d)
++        guard Array(b[0..<4]) == magic, b[4] == version else { return nil }
++        return ChannelEnvelopeHeader(ttl: min(b[5], maxTTL), channelID: Data(b[6..<14]),
++                                     msgID: Data(b[14..<30]), nonce: Data(b[30..<42]))
++    }
++
++    /// Returns the envelope with a new TTL byte (only unauthenticated field).
++    static func withTTL(_ envelope: Data, _ ttl: UInt8) -> Data {
++        var e = envelope
++        e[e.startIndex + 5] = ttl
++        return e
++    }
++
++    static func aad(_ envelope: Data) -> Data {
++        let b = [UInt8](envelope)
++        return Data(b[0..<5] + b[6..<30])
++    }
++}
++
++struct ChannelMessage: Equatable {
++    let channelID: Data
++    let msgID: Data
++    let originID: Data
++    let timestampMs: UInt64
++    let kind: ChannelMessageKind
++    let nickname: String
++    let body: String
++    var ttl: UInt8
++}
++
++enum ChannelCodec {
++    static let maxBodyBytes = 280
++    static let maxNickBytes = 32
++
++    static func seal(keys: ChannelKeys, originID: Data, nickname: String, body: String, kind: ChannelMessageKind,
++                     ttl: UInt8 = ChannelEnvelopeHeader.defaultTTL, timestampMs: UInt64,
++                     msgID: Data? = nil, nonce: Data? = nil) throws -> Data {
++        precondition(originID.count == 8)
++        let nick = Data(nickname.utf8.prefix(maxNickBytes))
++        let text = truncatedUTF8(body, maxBytes: maxBodyBytes)
++        var g = SystemRandomNumberGenerator()
++        let mid = msgID ?? Data((0..<16).map { _ in UInt8.random(in: 0...255, using: &g) })
++        let n = nonce ?? Data((0..<12).map { _ in UInt8.random(in: 0...255, using: &g) })
++        var header = Data(ChannelEnvelopeHeader.magic)
++        header.append(ChannelEnvelopeHeader.version)
++        header.append(min(ttl, ChannelEnvelopeHeader.maxTTL))
++        header.append(keys.channelID)
++        header.append(mid)
++        header.append(n)
++        var plain = Data(originID)
++        for s in stride(from: 56, through: 0, by: -8) { plain.append(UInt8((timestampMs >> UInt64(s)) & 0xff)) }
++        plain.append(kind.rawValue)
++        plain.append(UInt8(nick.count))
++        plain.append(nick)
++        plain.append(text)
++        let box = try ChaChaPoly.seal(plain, using: keys.key, nonce: try ChaChaPoly.Nonce(data: n),
++                                      authenticating: ChannelEnvelopeHeader.aad(header))
++        return header + box.ciphertext + box.tag
++    }
++
++    static func open(_ envelope: Data, keys: ChannelKeys) -> ChannelMessage? {
++        guard let h = ChannelEnvelopeHeader.parse(envelope), h.channelID == keys.channelID else { return nil }
++        let b = [UInt8](envelope)
++        let ct = Data(b[ChannelEnvelopeHeader.length ..< (b.count - 16)])
++        let tag = Data(b[(b.count - 16)...])
++        guard let nonce = try? ChaChaPoly.Nonce(data: h.nonce),
++              let box = try? ChaChaPoly.SealedBox(nonce: nonce, ciphertext: ct, tag: tag),
++              let plain = try? ChaChaPoly.open(box, using: keys.key, authenticating: ChannelEnvelopeHeader.aad(envelope)) else { return nil }
++        let p = [UInt8](plain)
++        guard p.count >= 18 else { return nil }
++        var ts: UInt64 = 0
++        for i in 8..<16 { ts = (ts << 8) | UInt64(p[i]) }
++        guard let kind = ChannelMessageKind(rawValue: p[16]) else { return nil }
++        let nl = Int(p[17])
++        guard p.count >= 18 + nl else { return nil }
++        let nick = String(decoding: p[18 ..< 18 + nl], as: UTF8.self)
++        let body = String(decoding: p[(18 + nl)...], as: UTF8.self)
++        return ChannelMessage(channelID: h.channelID, msgID: h.msgID, originID: Data(p[0..<8]),
++                              timestampMs: ts, kind: kind, nickname: nick, body: body, ttl: h.ttl)
++    }
++
++    static func truncatedUTF8(_ s: String, maxBytes: Int) -> Data {
++        var out = Data()
++        for ch in s {
++            let d = Data(String(ch).utf8)
++            if out.count + d.count > maxBytes { break }
++            out.append(d)
++        }
++        return out
++    }
++}
+diff --git a/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/ChannelRouter.swift b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/ChannelRouter.swift
+new file mode 100644
+index 0000000..41a4f87
+--- /dev/null
++++ b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/ChannelRouter.swift
+@@ -0,0 +1,170 @@
++//
++// ChannelRouter.swift — bitchat-watch channel chat forwarding core
++//
++// One router per device (iPhone companion, Mac tester). It owns channel
++// memberships, the msgID dedup cache, TTL handling and the bitchat-bridge rate
++// limit. Transports (LAN, MultipeerConnectivity, bitchat BLE tunnel) are dumb
++// pipes: they hand raw envelopes to `ingest` and send what `send` asks for.
++//
++// Forwarding rules (docs/wifi-channel.md §5):
++//  * only channels this device has joined are forwarded (others are opaque and dropped)
++//  * every msgID is delivered/forwarded at most once (bounded cache)
++//  * TTL: decremented by 1 per channel hop; not forwarded when it reaches 0/1
++//  * LAN/MPC: forwarded to every other link of both kinds except the arrival link
++//  * bitchat: only if the channel is bridged (opt-in), never back into bitchat,
++//    only `.text`/`.leave`, only envelopes <= ChannelTunnelWire.maxTunnelledEnvelopeBytes,
++//    and through a token bucket (default 6/min, burst 3) shared by all channels
++//
++// Threading: not thread-safe; call from one serial queue.
++//
++// SPDX-License-Identifier: GPL-3.0-or-later
++//
++
++import Foundation
++
++enum ChannelPath: String, Codable, CaseIterable {
++    case lan, mpc, bitchat
++}
++
++struct ChannelLinkRef: Hashable {
++    let path: ChannelPath
++    let id: String
++}
++
++struct ChannelMembership {
++    let keys: ChannelKeys
++    var displayName: String
++    var bridgeToBitchat: Bool
++}
++
++struct TokenBucket {
++    var capacity: Double
++    var refillPerSecond: Double
++    private(set) var tokens: Double
++    private var last: Date
++
++    init(capacity: Double, perMinute: Double, now: Date = Date()) {
++        self.capacity = capacity
++        self.refillPerSecond = perMinute / 60
++        self.tokens = capacity
++        self.last = now
++    }
++
++    mutating func take(now: Date = Date()) -> Bool {
++        tokens = min(capacity, tokens + now.timeIntervalSince(last) * refillPerSecond)
++        last = now
++        guard tokens >= 1 else { return false }
++        tokens -= 1
++        return true
++    }
++}
++
++final class ChannelRouter {
++    enum Event {
++        case message(ChannelMessage, channelName: String, via: ChannelPath, bridged: Bool)
++        case dropped(reason: String)
++    }
++
++    // identity
++    let originID: Data
++    var nickname: String
++
++    // outputs
++    /// Send `envelope` on `path`. `except` = arrival link to skip (nil = all links of that path).
++    var transmit: (_ envelope: Data, _ path: ChannelPath, _ except: ChannelLinkRef?) -> Void = { _, _, _ in }
++    var onEvent: (Event) -> Void = { _ in }
++    var now: () -> Date = { Date() }
++
++    // state
++    private(set) var memberships: [Data: ChannelMembership] = [:]
++    private var seen = BoundedSeenSet(capacity: 4096)
++    var bridgeBucket = TokenBucket(capacity: 3, perMinute: 6)
++    private(set) var bridgedOut = 0
++    private(set) var bridgeDropsRateLimited = 0
++
++    init(originID: Data, nickname: String) {
++        precondition(originID.count == 8)
++        self.originID = originID
++        self.nickname = nickname
++    }
++
++    // MARK: membership
++
++    @discardableResult
++    func join(code: String, displayName: String? = nil, bridge: Bool = false) -> ChannelKeys? {
++        guard let keys = ChannelKeys(code: code) else { return nil }
++        memberships[keys.channelID] = ChannelMembership(keys: keys, displayName: displayName ?? "#\(keys.code)", bridgeToBitchat: bridge)
++        return keys
++    }
++
++    func leave(channelID: Data) {
++        if let m = memberships[channelID] { _ = try? sendRaw(m, kind: .leave, body: "", ttl: 1) }
++        memberships.removeValue(forKey: channelID)
++    }
++
++    func setBridge(_ on: Bool, channelID: Data) { memberships[channelID]?.bridgeToBitchat = on }
++
++    /// Hex channel IDs advertised in Bonjour TXT / MPC discoveryInfo.
++    var advertisedChannelIDs: [String] { memberships.keys.map { $0.hexEncodedString() }.sorted() }
++
++    // MARK: outbound
++
++    @discardableResult
++    func send(text: String, channelID: Data, ttl: UInt8 = ChannelEnvelopeHeader.defaultTTL) -> ChannelMessage? {
++        guard let m = memberships[channelID] else { return nil }
++        return try? sendRaw(m, kind: .text, body: text, ttl: ttl)
++    }
++
++    func sendHello(channelID: Data) {
++        guard let m = memberships[channelID] else { return }
++        _ = try? sendRaw(m, kind: .hello, body: "", ttl: 1)
++    }
++
++    private func sendRaw(_ m: ChannelMembership, kind: ChannelMessageKind, body: String, ttl: UInt8) throws -> ChannelMessage? {
++        let env = try ChannelCodec.seal(keys: m.keys, originID: originID, nickname: nickname, body: body, kind: kind,
++                                        ttl: ttl, timestampMs: unixMillis(now()))
++        guard let h = ChannelEnvelopeHeader.parse(env) else { return nil }
++        seen.insert(h.msgIDHex)
++        transmit(env, .lan, nil)
++        transmit(env, .mpc, nil)
++        if m.bridgeToBitchat && kind != .hello { bridgeOut(env) }
++        return ChannelCodec.open(env, keys: m.keys)
++    }
++
++    // MARK: inbound
++
++    func ingest(_ envelope: Data, from link: ChannelLinkRef) {
++        guard let h = ChannelEnvelopeHeader.parse(envelope) else { onEvent(.dropped(reason: "not a channel envelope")); return }
++        guard let m = memberships[h.channelID] else { return } // not our channel: opaque, ignore
++        guard !seen.contains(h.msgIDHex) else { return }
++        guard let msg = ChannelCodec.open(envelope, keys: m.keys) else {
++            onEvent(.dropped(reason: "auth failed (wrong code or tampered)"))
++            return
++        }
++        seen.insert(h.msgIDHex)
++        if msg.originID == originID { return } // our own message looped back
++        onEvent(.message(msg, channelName: m.displayName, via: link.path, bridged: link.path == .bitchat))
++
++        // forward
++        guard msg.kind != .hello, h.ttl > 1 else { return }
++        let fwd = ChannelEnvelopeHeader.withTTL(envelope, h.ttl - 1)
++        for path in [ChannelPath.lan, .mpc] {
++            transmit(fwd, path, link.path == path ? link : nil)
++        }
++        if m.bridgeToBitchat && link.path != .bitchat { bridgeOut(fwd) }
++    }
++
++    private func bridgeOut(_ envelope: Data) {
++        guard envelope.count <= ChannelTunnelWire.maxTunnelledEnvelopeBytes else {
++            onEvent(.dropped(reason: "too large to bridge into bitchat"))
++            return
++        }
++        guard bridgeBucket.take(now: now()) else {
++            bridgeDropsRateLimited += 1
++            onEvent(.dropped(reason: "bitchat bridge rate limit"))
++            return
++        }
++        bridgedOut += 1
++        transmit(envelope, .bitchat, nil)
++    }
++}
+diff --git a/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/ChannelSupport.swift b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/ChannelSupport.swift
+new file mode 100644
+index 0000000..f667c4f
+--- /dev/null
++++ b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/ChannelSupport.swift
+@@ -0,0 +1,28 @@
++//
++// ChannelSupport.swift — bitchat-watch
++// Small helpers shared by the channel core and the bitchat leaf engine
++// (kept dependency-free so the iPhone bridge package can compile it alone).
++// SPDX-License-Identifier: GPL-3.0-or-later
++//
++
++import Foundation
++
++func unixMillis(_ d: Date) -> UInt64 { UInt64(max(0, d.timeIntervalSince1970) * 1000) }
++
++/// FIFO-bounded set for dedup.
++struct BoundedSeenSet {
++    private var set = Set<String>()
++    private var order: [String] = []
++    let capacity: Int
++    init(capacity: Int) { self.capacity = capacity }
++    func contains(_ s: String) -> Bool { set.contains(s) }
++    mutating func insert(_ s: String) {
++        guard set.insert(s).inserted else { return }
++        order.append(s)
++        if order.count > capacity {
++            let drop = order.count - capacity
++            for old in order.prefix(drop) { set.remove(old) }
++            order.removeFirst(drop)
++        }
++    }
++}
+diff --git a/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/CompanionProtocol.swift b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/CompanionProtocol.swift
+new file mode 100644
+index 0000000..a9af182
+--- /dev/null
++++ b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/CompanionProtocol.swift
+@@ -0,0 +1,64 @@
++//
++// CompanionProtocol.swift — bitchat-watch
++//
++// Messages exchanged between the watch app and the iPhone companion bridge over
++// WatchConnectivity. Shared verbatim by both sides. Each message is JSON in a
++// WCSession message dictionary under key "hk" (sendMessage when reachable,
++// transferUserInfo as a queued fallback for watch→phone sends). The phone also
++// keeps an applicationContext snapshot so the watch has something to show the
++// moment it launches.
++//
++// SPDX-License-Identifier: GPL-3.0-or-later
++//
++
++import Foundation
++
++enum CompanionWire {
++    static let key = "hk"
++    static let version = 1
++    static let contextKey = "hkSnapshot"
++}
++
++struct CompanionSnapshot: Codable, Equatable {
++    var phoneNickname: String
++    var people: [UnifiedPerson]          // network == .bitchatPhone
++    var rooms: [RoomInfo]                // bitchat public + joined channel-chat channels
++    var recent: [UnifiedMessage]         // last N messages across rooms/DMs
++    var bridgeAvailable: Bool            // phone can tunnel channel chat into bitchat
++}
++
++enum CompanionMessage: Codable, Equatable {
++    // phone -> watch
++    case snapshot(CompanionSnapshot)
++    case message(UnifiedMessage)
++    case people([UnifiedPerson])
++    case rooms([RoomInfo])
++    case delivery(messageID: String, state: DeliveryState)
++    case error(String)
++
++    // watch -> phone
++    case requestSnapshot
++    case sendRoom(conversation: ConversationID, text: String, clientID: String)
++    case sendDirect(peerKey: String, text: String, clientID: String)
++    case joinChannel(code: String, bridge: Bool)
++    case leaveChannel(channelIDHex: String)
++    case setChannelBridge(channelIDHex: String, enabled: Bool)
++    case toggleFavorite(peerKey: String)
++
++    func encodeToDictionary() -> [String: Any] {
++        let data = (try? JSONEncoder().encode(CompanionEnvelope(v: CompanionWire.version, m: self))) ?? Data()
++        return [CompanionWire.key: data]
++    }
++
++    static func decode(fromDictionary d: [String: Any]) -> CompanionMessage? {
++        guard let data = d[CompanionWire.key] as? Data,
++              let env = try? JSONDecoder().decode(CompanionEnvelope.self, from: data),
++              env.v == CompanionWire.version else { return nil }
++        return env.m
++    }
++}
++
++struct CompanionEnvelope: Codable, Equatable {
++    let v: Int
++    let m: CompanionMessage
++}
+diff --git a/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/Data+Hex.swift b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/Data+Hex.swift
+new file mode 100644
+index 0000000..e116ba1
+--- /dev/null
++++ b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/Data+Hex.swift
+@@ -0,0 +1,77 @@
++//
++// Data+Hex.swift
++// BitFoundation
++//
++// This is free and unencumbered software released into the public domain.
++// For more information, see <https://unlicense.org>
++//
++
++import struct Foundation.Data
++
++extension Data {
++    /// Lowercase hex, two digits per byte, no separators.
++    ///
++    /// Table lookup instead of `String(format:)` per byte: Nostr public keys
++    /// are re-encoded on hot paths (geochat roster rebuilds touch one per
++    /// participant), and the formatted version cost ~14 µs per 32-byte key.
++    func hexEncodedString() -> String {
++        if self.isEmpty {
++            return ""
++        }
++        return String(unsafeUninitializedCapacity: count * 2) { buffer in
++            var index = 0
++            for byte in self {
++                buffer[index] = Self.lowercaseHexDigits[Int(byte >> 4)]
++                buffer[index + 1] = Self.lowercaseHexDigits[Int(byte & 0x0F)]
++                index += 2
++            }
++            return index
++        }
++    }
++
++    private static let lowercaseHexDigits: [UInt8] = Array("0123456789abcdef".utf8)
++
++    /// Initialize Data from a hex string.
++    /// - Parameter hexString: A hex string, optionally prefixed with "0x" or "0X".
++    ///   Whitespace is trimmed. Must have even length after prefix removal.
++    /// - Returns: nil if the string has odd length or contains invalid hex characters.
++    init?(hexString: String) {
++        var hex = hexString.trimmed
++
++        // Remove optional 0x prefix
++        if hex.hasPrefix("0x") || hex.hasPrefix("0X") {
++            hex = String(hex.dropFirst(2))
++        }
++
++        // Reject odd-length strings
++        guard hex.count % 2 == 0 else {
++            return nil
++        }
++
++        // Reject empty strings
++        guard !hex.isEmpty else {
++            self = Data()
++            return
++        }
++
++        let len = hex.count / 2
++        var data = Data(capacity: len)
++        var index = hex.startIndex
++
++        for _ in 0..<len {
++            let nextIndex = hex.index(index, offsetBy: 2)
++            let pair = hex[index..<nextIndex]
++            // UInt8(_:radix:) accepts a leading sign, so "+f" parses as 0x0f.
++            // That gives an identity-bearing hex string a second spelling which
++            // decodes to the same bytes, so require two hex digits first.
++            guard pair.allSatisfy(\.isHexDigit),
++                  let byte = UInt8(pair, radix: 16) else {
++                return nil
++            }
++            data.append(byte)
++            index = nextIndex
++        }
++
++        self = data
++    }
++}
+diff --git a/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/Data+SHA256.swift b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/Data+SHA256.swift
+new file mode 100644
+index 0000000..1fee155
+--- /dev/null
++++ b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/Data+SHA256.swift
+@@ -0,0 +1,33 @@
++//
++// Data+SHA256.swift
++// BitFoundation
++//
++// This is free and unencumbered software released into the public domain.
++// For more information, see <https://unlicense.org>
++//
++
++import struct Foundation.Data
++import CryptoKit
++
++extension Data {
++    /// Returns the hex representation of SHA256 hash
++    func sha256Fingerprint() -> String {
++        // Implementation matches existing fingerprint generation in NoiseEncryptionService
++        sha256Hash().hexEncodedString()
++    }
++
++    /// Returns the SHA256 hash wrapped in Data
++    func sha256Hash() -> Data {
++        Data(sha256Digest)
++    }
++
++    func sha256Hex() -> String {
++        sha256Digest.map { String(format: "%02x", $0) }.joined()
++    }
++}
++
++private extension Data {
++    var sha256Digest: SHA256.Digest {
++        SHA256.hash(data: self)
++    }
++}
+diff --git a/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/LANChannelTransport.swift b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/LANChannelTransport.swift
+new file mode 100644
+index 0000000..28ff277
+--- /dev/null
++++ b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/LANChannelTransport.swift
+@@ -0,0 +1,142 @@
++//
++// LANChannelTransport.swift — bitchat-watch iPhone companion
++//
++// Channel chat over the local network (no internet): Bonjour `_hkchan._tcp`
++// via Network.framework. Each device advertises one service whose TXT record
++// carries `v=1` and `c=<comma-separated channel-ID hex>` (8-byte HKDF-derived
++// IDs, never the codes). Devices sharing at least one channel connect over TCP;
++// to avoid duplicate pairs only the side with the lexicographically smaller
++// instance name dials. Frames: 4-byte big-endian length + channel envelope
++// (≤ 4096 bytes). Envelopes are already ChaCha20-Poly1305 sealed with the
++// channel key, so TCP carries no extra TLS.
++//
++// SPDX-License-Identifier: GPL-3.0-or-later
++//
++
++import Foundation
++import Network
++
++@MainActor
++final class LANChannelTransport {
++    static let serviceType = "_hkchan._tcp"
++    let instanceName = "hk-" + UUID().uuidString.prefix(12).lowercased()
++
++    var onEnvelope: (Data, String) -> Void = { _, _ in }     // (envelope, linkID)
++    var onPeersChanged: (Int) -> Void = { _ in }
++
++    private var listener: NWListener?
++    private var browser: NWBrowser?
++    private var connections: [String: NWConnection] = [:]
++    private var buffers: [String: Data] = [:]
++    private var dialed: Set<String> = []
++    private var channelIDs: [String] = []
++    private let queue = DispatchQueue.main
++
++    func update(channelIDs ids: [String]) {
++        guard ids != channelIDs else { return }
++        channelIDs = ids
++        restart()
++    }
++
++    func stop() {
++        listener?.cancel(); listener = nil
++        browser?.cancel(); browser = nil
++        connections.values.forEach { $0.cancel() }
++        connections.removeAll(); buffers.removeAll(); dialed.removeAll()
++        onPeersChanged(0)
++    }
++
++    func send(_ envelope: Data, except: String?) {
++        guard envelope.count <= ChannelEnvelopeHeader.maxEnvelopeBytes else { return }
++        var framed = Data([UInt8(envelope.count >> 24 & 0xff), UInt8(envelope.count >> 16 & 0xff),
++                           UInt8(envelope.count >> 8 & 0xff), UInt8(envelope.count & 0xff)])
++        framed.append(envelope)
++        for (id, c) in connections where id != except {
++            c.send(content: framed, completion: .contentProcessed { _ in })
++        }
++    }
++
++    var peerCount: Int { connections.count }
++
++    private func restart() {
++        stop()
++        guard !channelIDs.isEmpty else { return }
++        do {
++            let l = try NWListener(using: .tcp)
++            var txt = NWTXTRecord()
++            txt["v"] = "1"
++            txt["c"] = channelIDs.prefix(16).joined(separator: ",")
++            l.service = NWListener.Service(name: instanceName, type: Self.serviceType, domain: nil, txtRecord: txt)
++            l.newConnectionHandler = { [weak self] conn in
++                MainActor.assumeIsolated { self?.adopt(conn, id: "in-\(UUID().uuidString.prefix(8))") }
++            }
++            l.start(queue: queue)
++            listener = l
++        } catch {
++            SecureLogger.error("LAN listener failed: \(error)")
++        }
++        let b = NWBrowser(for: .bonjourWithTXTRecord(type: Self.serviceType, domain: nil), using: .tcp)
++        b.browseResultsChangedHandler = { [weak self] results, _ in
++            MainActor.assumeIsolated { self?.handle(results) }
++        }
++        b.start(queue: queue)
++        browser = b
++    }
++
++    private func handle(_ results: Set<NWBrowser.Result>) {
++        for r in results {
++            guard case .service(let name, _, _, _) = r.endpoint, name != instanceName, !dialed.contains(name) else { continue }
++            guard case .bonjour(let txt) = r.metadata, txt["v"] == "1" else { continue }
++            let theirs = Set((txt["c"] ?? "").split(separator: ",").map(String.init))
++            guard !theirs.isDisjoint(with: channelIDs), instanceName < name else { continue }
++            dialed.insert(name)
++            adopt(NWConnection(to: r.endpoint, using: .tcp), id: "out-\(name)")
++        }
++    }
++
++    private func adopt(_ c: NWConnection, id: String) {
++        connections[id] = c
++        c.stateUpdateHandler = { [weak self] state in
++            MainActor.assumeIsolated {
++                switch state {
++                case .ready: self?.onPeersChanged(self?.connections.count ?? 0)
++                case .failed, .cancelled: self?.drop(id)
++                default: break
++                }
++            }
++        }
++        c.start(queue: queue)
++        receive(c, id: id)
++    }
++
++    private func drop(_ id: String) {
++        connections.removeValue(forKey: id)?.cancel()
++        buffers.removeValue(forKey: id)
++        if id.hasPrefix("out-") { dialed.remove(String(id.dropFirst(4))) }
++        onPeersChanged(connections.count)
++    }
++
++    private func receive(_ c: NWConnection, id: String) {
++        c.receive(minimumIncompleteLength: 1, maximumLength: 16 * 1024) { [weak self] data, _, done, error in
++            MainActor.assumeIsolated {
++                guard let self = self else { return }
++                if let d = data, !d.isEmpty { self.consume(d, id: id) }
++                if done || error != nil { self.drop(id); return }
++                self.receive(c, id: id)
++            }
++        }
++    }
++
++    private func consume(_ d: Data, id: String) {
++        var buf = (buffers[id] ?? Data()) + d
++        while buf.count >= 4 {
++            let b = [UInt8](buf.prefix(4))
++            let len = Int(b[0]) << 24 | Int(b[1]) << 16 | Int(b[2]) << 8 | Int(b[3])
++            guard len > 0, len <= ChannelEnvelopeHeader.maxEnvelopeBytes else { drop(id); return }
++            guard buf.count >= 4 + len else { break }
++            onEnvelope(Data(buf.subdata(in: buf.startIndex + 4 ..< buf.startIndex + 4 + len)), id)
++            buf = Data(buf.dropFirst(4 + len))
++        }
++        buffers[id] = buf
++    }
++}
+diff --git a/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/MPCChannelTransport.swift b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/MPCChannelTransport.swift
+new file mode 100644
+index 0000000..c762dfc
+--- /dev/null
++++ b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/MPCChannelTransport.swift
+@@ -0,0 +1,118 @@
++//
++// MPCChannelTransport.swift — bitchat-watch iPhone companion
++//
++// Channel chat over MultipeerConnectivity (router-free peer-to-peer Wi-Fi /
++// Bluetooth between Apple devices). Service type "hk-chan". discoveryInfo
++// carries `v=1` and `c=<comma-separated channel-ID hex>` — HKDF-derived IDs,
++// never the channel code. Devices sharing a channel invite each other (only
++// the smaller displayName invites, to avoid crossed invitations); sessions use
++// encryptionPreference .required. Each MPC message is exactly one envelope.
++//
++// Limits: Apple-only; iOS suspends MPC when the app is backgrounded (links
++// drop and come back on foreground); discoveryInfo should stay small (≤ ~400
++// bytes), so at most 16 channel IDs are advertised.
++//
++// SPDX-License-Identifier: GPL-3.0-or-later
++//
++
++import Foundation
++import MultipeerConnectivity
++
++@MainActor
++final class MPCChannelTransport: NSObject {
++    static let serviceType = "hk-chan"   // ≤15 chars, lowercase letters/digits/hyphen
++    private let me = MCPeerID(displayName: "hk-" + UUID().uuidString.prefix(8).lowercased())
++    private var session: MCSession!
++    private var advertiser: MCNearbyServiceAdvertiser?
++    private var browser: MCNearbyServiceBrowser?
++    private var channelIDs: [String] = []
++
++    var onEnvelope: (Data, String) -> Void = { _, _ in }
++    var onPeersChanged: (Int) -> Void = { _ in }
++
++    override init() {
++        super.init()
++        session = MCSession(peer: me, securityIdentity: nil, encryptionPreference: .required)
++        session.delegate = self
++    }
++
++    func update(channelIDs ids: [String]) {
++        guard ids != channelIDs else { return }
++        channelIDs = ids
++        restart()
++    }
++
++    func stop() {
++        advertiser?.stopAdvertisingPeer(); advertiser = nil
++        browser?.stopBrowsingForPeers(); browser = nil
++        session.disconnect()
++        onPeersChanged(0)
++    }
++
++    var peerCount: Int { session.connectedPeers.count }
++
++    func send(_ envelope: Data, except: String?) {
++        let targets = session.connectedPeers.filter { $0.displayName != except }
++        guard !targets.isEmpty else { return }
++        try? session.send(envelope, toPeers: targets, with: .reliable)
++    }
++
++    private var info: [String: String] { ["v": "1", "c": channelIDs.prefix(16).joined(separator: ",")] }
++
++    private func restart() {
++        advertiser?.stopAdvertisingPeer(); browser?.stopBrowsingForPeers()
++        guard !channelIDs.isEmpty else { stop(); return }
++        let a = MCNearbyServiceAdvertiser(peer: me, discoveryInfo: info, serviceType: Self.serviceType)
++        a.delegate = self
++        a.startAdvertisingPeer()
++        advertiser = a
++        let b = MCNearbyServiceBrowser(peer: me, serviceType: Self.serviceType)
++        b.delegate = self
++        b.startBrowsingForPeers()
++        browser = b
++    }
++
++    private func sharesChannel(_ csv: String?) -> Bool {
++        let theirs = Set((csv ?? "").split(separator: ",").map(String.init))
++        return !theirs.isDisjoint(with: channelIDs)
++    }
++}
++
++extension MPCChannelTransport: MCNearbyServiceBrowserDelegate {
++    nonisolated func browser(_ browser: MCNearbyServiceBrowser, foundPeer peerID: MCPeerID, withDiscoveryInfo info: [String: String]?) {
++        let csv = info?["c"], v = info?["v"]
++        Task { @MainActor in
++            guard v == "1", self.sharesChannel(csv), self.me.displayName < peerID.displayName,
++                  !self.session.connectedPeers.contains(peerID) else { return }
++            let ctx = self.channelIDs.joined(separator: ",").data(using: .utf8)
++            browser.invitePeer(peerID, to: self.session, withContext: ctx, timeout: 15)
++        }
++    }
++    nonisolated func browser(_ browser: MCNearbyServiceBrowser, lostPeer peerID: MCPeerID) {}
++}
++
++extension MPCChannelTransport: MCNearbyServiceAdvertiserDelegate {
++    nonisolated func advertiser(_ advertiser: MCNearbyServiceAdvertiser, didReceiveInvitationFromPeer peerID: MCPeerID,
++                                withContext context: Data?, invitationHandler: @escaping (Bool, MCSession?) -> Void) {
++        let csv = context.flatMap { String(data: $0, encoding: .utf8) }
++        nonisolated(unsafe) let handler = invitationHandler
++        Task { @MainActor in
++            let ok = self.sharesChannel(csv)
++            handler(ok, ok ? self.session : nil)
++        }
++    }
++}
++
++extension MPCChannelTransport: MCSessionDelegate {
++    nonisolated func session(_ session: MCSession, peer peerID: MCPeerID, didChange state: MCSessionState) {
++        let n = session.connectedPeers.count
++        Task { @MainActor in self.onPeersChanged(n) }
++    }
++    nonisolated func session(_ session: MCSession, didReceive data: Data, fromPeer peerID: MCPeerID) {
++        let name = peerID.displayName
++        Task { @MainActor in self.onEnvelope(data, name) }
++    }
++    nonisolated func session(_ session: MCSession, didReceive stream: InputStream, withName streamName: String, fromPeer peerID: MCPeerID) {}
++    nonisolated func session(_ session: MCSession, didStartReceivingResourceWithName resourceName: String, fromPeer peerID: MCPeerID, with progress: Progress) {}
++    nonisolated func session(_ session: MCSession, didFinishReceivingResourceWithName resourceName: String, fromPeer peerID: MCPeerID, at localURL: URL?, withError error: Error?) {}
++}
+diff --git a/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/String+Ext.swift b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/String+Ext.swift
+new file mode 100644
+index 0000000..e6b3d04
+--- /dev/null
++++ b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/String+Ext.swift
+@@ -0,0 +1,22 @@
++//
++// String+Ext.swift
++// BitFoundation
++//
++// This is free and unencumbered software released into the public domain.
++// For more information, see <https://unlicense.org>
++//
++
++extension StringProtocol {
++    var trimmed: String {
++        trimmingCharacters(in: .whitespacesAndNewlines)
++    }
++
++    var trimmedOrNilIfEmpty: String? {
++        let trimmed = self.trimmed
++        return trimmed.isEmpty ? nil : trimmed
++    }
++
++    var nilIfEmpty: Self? {
++        isEmpty ? nil : self
++    }
++}
+diff --git a/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/UnifiedModels.swift b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/UnifiedModels.swift
+new file mode 100644
+index 0000000..949ad2c
+--- /dev/null
++++ b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/UnifiedModels.swift
+@@ -0,0 +1,91 @@
++//
++// UnifiedModels.swift — bitchat-watch
++//
++// Network-neutral models behind the watch's single inbox. Every conversation,
++// person and message carries its NetworkKind so the UI can always label which
++// network (and which radio / phone path) it belongs to. Nothing is merged
++// across networks: the same human on bitchat and Meshtastic is two people.
++//
++// SPDX-License-Identifier: GPL-3.0-or-later
++//
++
++import Foundation
++
++enum NetworkKind: String, Codable, CaseIterable, Hashable {
++    case bitchat          // direct BLE mesh from the watch (leaf)
++    case bitchatPhone     // bitchat via the paired iPhone (WatchConnectivity)
++    case meshtastic       // Meshtastic LoRa radio over BLE
++    case meshcore         // MeshCore LoRa companion radio over BLE
++    case channel          // local channel chat (LAN/MPC/bridge) via the iPhone
++
++    var shortLabel: String {
++        switch self {
++        case .bitchat: return "bitchat"
++        case .bitchatPhone: return "bitchat·📱"
++        case .meshtastic: return "Meshtastic"
++        case .meshcore: return "MeshCore"
++        case .channel: return "Wi-Fi ch"
++        }
++    }
++    var badge: String {
++        switch self {
++        case .bitchat: return "BC"
++        case .bitchatPhone: return "BC📱"
++        case .meshtastic: return "MT"
++        case .meshcore: return "MC"
++        case .channel: return "CH"
++        }
++    }
++}
++
++struct ConversationID: Hashable, Codable, CustomStringConvertible {
++    enum Scope: String, Codable { case room, direct }
++    let network: NetworkKind
++    let scope: Scope
++    /// room: channel key ("public", Meshtastic channel index, MeshCore channel index, channel-chat ID hex)
++    /// direct: peer key (bitchat peerID hex, "!nodenum", MeshCore pubkey prefix hex)
++    let key: String
++
++    static func room(_ n: NetworkKind, _ key: String) -> ConversationID { .init(network: n, scope: .room, key: key) }
++    static func direct(_ n: NetworkKind, _ key: String) -> ConversationID { .init(network: n, scope: .direct, key: key) }
++    var description: String { "\(network.rawValue)/\(scope.rawValue)/\(key)" }
++}
++
++enum DeliveryState: String, Codable {
++    case sending, sent, delivered, read, failed, received
++}
++
++struct UnifiedMessage: Codable, Identifiable, Equatable {
++    let id: String
++    let conversation: ConversationID
++    let senderName: String
++    let senderKey: String
++    let text: String
++    let timestamp: Date
++    let outgoing: Bool
++    var state: DeliveryState
++    /// Arrived (or left) through a bridge hop, e.g. a channel message tunnelled via bitchat.
++    var bridged: Bool = false
++    /// Free-form path note for the detail view ("LAN", "MPC", "bitchat bridge", "SNR 6.5").
++    var via: String? = nil
++}
++
++struct UnifiedPerson: Codable, Identifiable, Hashable {
++    var id: String { "\(network.rawValue):\(key)" }
++    let network: NetworkKind
++    let key: String
++    var displayName: String
++    var detail: String           // fingerprint prefix, node id, RSSI/SNR, hops
++    var isOnline: Bool
++    var isFavorite: Bool
++    var canMessage: Bool
++    var secureSession: Bool = false
++}
++
++struct RoomInfo: Codable, Hashable, Identifiable {
++    var id: ConversationID { conversation }
++    let conversation: ConversationID
++    var title: String
++    var bridged: Bool = false     // channel chat: bridged into bitchat (opt-in)
++    var memberCount: Int? = nil
++}
+diff --git a/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/UpstreamShims.swift b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/UpstreamShims.swift
+new file mode 100644
+index 0000000..4e2ee2e
+--- /dev/null
++++ b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/UpstreamShims.swift
+@@ -0,0 +1,101 @@
++//
++// UpstreamShims.swift — bitchat-watch
++//
++// Minimal stand-ins for upstream bitchat dependencies (BitLogger.SecureLogger,
++// BitFoundation.KeychainManagerProtocol, TransportConfig) so the vendored
++// protocol/Noise files in ../Upstream and ../Noise compile unchanged inside the
++// watch app target, the iOS bridge, and the Linux typecheck harness.
++//
++// SPDX-License-Identifier: GPL-3.0-or-later (this file); the vendored files keep
++// their original Unlicense headers.
++//
++
++import Foundation
++#if canImport(os)
++import os
++#endif
++
++/// Log categories used by the vendored files.
++enum LogCategory: String {
++    case session, security, encryption, noise, general
++}
++
++/// Structured security events used by vendored NoiseSession / NoiseEncryptionService.
++enum SecurityEvent {
++    case handshakeStarted(peerID: String)
++    case handshakeCompleted(peerID: String)
++    case handshakeFailed(peerID: String, error: String)
++    case sessionExpired(peerID: String)
++    case authenticationFailed(peerID: String)
++
++    var message: String {
++        switch self {
++        case .handshakeStarted(let p): return "Noise handshake started with \(p.prefix(8))…"
++        case .handshakeCompleted(let p): return "Noise handshake completed with \(p.prefix(8))…"
++        case .handshakeFailed(let p, let e): return "Noise handshake failed with \(p.prefix(8))…: \(e)"
++        case .sessionExpired(let p): return "Noise session expired for \(p.prefix(8))…"
++        case .authenticationFailed(let p): return "Authentication failed for \(p.prefix(8))…"
++        }
++    }
++}
++
++/// Tiny logger compatible with the call shapes used by the vendored files.
++/// Never logs message contents or key material (the vendored callers don't pass any).
++enum SecureLogger {
++    nonisolated(unsafe) static var sink: ((String) -> Void)? = nil
++    #if DEBUG
++    nonisolated(unsafe) static var minimumLevel = 0
++    #else
++    nonisolated(unsafe) static var minimumLevel = 2
++    #endif
++
++    private static func emit(_ level: Int, _ tag: String, _ text: @autoclosure () -> String, _ category: LogCategory) {
++        guard level >= minimumLevel else { return }
++        let line = "[\(tag)][\(category.rawValue)] \(text())"
++        if let sink = sink { sink(line); return }
++        #if canImport(os)
++        os_log("%{public}@", line)
++        #else
++        print(line)
++        #endif
++    }
++
++    static func debug(_ text: @autoclosure () -> String, category: LogCategory = .general) { emit(0, "D", text(), category) }
++    static func info(_ text: @autoclosure () -> String, category: LogCategory = .general) { emit(1, "I", text(), category) }
++    static func warning(_ text: @autoclosure () -> String, category: LogCategory = .general) { emit(2, "W", text(), category) }
++    static func error(_ text: @autoclosure () -> String, category: LogCategory = .general) { emit(3, "E", text(), category) }
++
++    static func debug(_ event: SecurityEvent) { emit(0, "D", event.message, .security) }
++    static func info(_ event: SecurityEvent) { emit(1, "I", event.message, .security) }
++    static func warning(_ event: SecurityEvent) { emit(2, "W", event.message, .security) }
++    static func error(_ event: SecurityEvent) { emit(3, "E", event.message, .security) }
++}
++
++/// Subset of BitFoundation.KeychainManagerProtocol needed by NoiseProtocol/NoiseSession.
++protocol KeychainManagerProtocol: AnyObject {
++    func secureClear(_ data: inout Data)
++}
++
++/// Default zeroizer (best effort: Swift CoW means older copies may survive).
++final class MemoryZeroizer: KeychainManagerProtocol, @unchecked Sendable {
++    static let shared = MemoryZeroizer()
++    func secureClear(_ data: inout Data) {
++        guard !data.isEmpty else { return }
++        data.resetBytes(in: 0..<data.count)
++        data = Data()
++    }
++}
++
++/// Constants mirrored from upstream bitchat Services/TransportConfig.swift @ 04995f68.
++enum TransportConfig {
++    static let bleDefaultFragmentSize: Int = 469
++    static let messageTTLDefault: UInt8 = 7
++    static let bleNotificationAssemblerHardCapBytes: Int = 8 * 1024 * 1024
++    static let bleAssemblerStallResetMs: Int = 250
++    static let bleFragmentLifetimeSeconds: TimeInterval = 30.0
++    static let bleFragmentSpacingMs: Int = 30
++    static let bleFragmentSpacingDirectedMs: Int = 25
++    /// Upstream accepts public messages up to the gossip-sync window; we use the
++    /// announce freshness window (900 s) for announces and this for messages.
++    static let syncPublicMessageMaxAgeSeconds: TimeInterval = 6 * 60 * 60
++}
+diff --git a/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/WatchBridgeHub.swift b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/WatchBridgeHub.swift
+new file mode 100644
+index 0000000..df4fda5
+--- /dev/null
++++ b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/WatchBridgeHub.swift
+@@ -0,0 +1,131 @@
++//
++// WatchBridgeHub.swift — bitchat-watch iPhone companion bridge
++//
++// The phone side of companion mode. A WCSessionDelegate that:
++//   * forwards the phone's bitchat chat (any CompanionChatSource — the patched
++//     upstream ChatViewModel adapter, or the standalone host's leaf engine) to
++//     the watch as NetworkKind.bitchatPhone,
++//   * runs ChannelChatService (LAN + MPC + optional bitchat bridge) and shows
++//     it on the watch as NetworkKind.channel,
++//   * executes watch requests (send, join/leave channel, bridge toggle, favorite).
++// It is additive: the host app only has to create it and keep a reference.
++//
++// SPDX-License-Identifier: GPL-3.0-or-later
++//
++
++import Foundation
++import WatchConnectivity
++
++/// What the bridge needs from the phone's bitchat stack.
++@MainActor
++protocol CompanionChatSource: AnyObject {
++    var nickname: String { get }
++    var people: [UnifiedPerson] { get }            // network = .bitchatPhone
++    var recentMessages: [UnifiedMessage] { get }   // network = .bitchatPhone
++    /// Called by the source when something changed (bridge then pushes a delta / snapshot).
++    var onMessage: ((UnifiedMessage) -> Void)? { get set }
++    var onPeopleChanged: (() -> Void)? { get set }
++    func sendPublic(_ text: String) -> UnifiedMessage?
++    func sendPrivate(_ text: String, peerKey: String) -> UnifiedMessage?
++    func toggleFavorite(peerKey: String)
++    /// Opaque channel-tunnel support (nil if the bitchat stack can't send/receive type 0x7E).
++    var tunnelSend: ((Data, UInt8) -> Void)? { get }
++    var onTunnelReceive: ((Data, String) -> Void)? { get set }
++}
++
++@MainActor
++final class WatchBridgeHub: NSObject {
++    let source: CompanionChatSource
++    let channels: ChannelChatService
++    private var session: WCSession? { WCSession.isSupported() ? WCSession.default : nil }
++    private var contextTimer: Timer?
++
++    init(source: CompanionChatSource) {
++        self.source = source
++        self.channels = ChannelChatService(nickname: source.nickname)
++        super.init()
++        channels.bitchatTunnelSend = source.tunnelSend
++        source.onTunnelReceive = { [weak self] env, peer in self?.channels.ingestFromBitchat(env, from: peer) }
++        source.onMessage = { [weak self] m in self?.push(.message(m)) }
++        source.onPeopleChanged = { [weak self] in
++            guard let self = self else { return }
++            self.push(.people(self.source.people)); self.scheduleContextUpdate()
++        }
++        channels.onMessage = { [weak self] m in self?.push(.message(m)) }
++        channels.onChange = { [weak self] in
++            guard let self = self else { return }
++            self.push(.rooms(self.channels.rooms)); self.scheduleContextUpdate()
++        }
++    }
++
++    func start() {
++        guard let s = session else { return }
++        s.delegate = self
++        s.activate()
++    }
++
++    func snapshot() -> CompanionSnapshot {
++        let publicRoom = RoomInfo(conversation: .room(.bitchatPhone, "public"), title: "Mesh · via iPhone")
++        return CompanionSnapshot(phoneNickname: source.nickname, people: source.people,
++                                 rooms: [publicRoom] + channels.rooms,
++                                 recent: Array(source.recentMessages.suffix(40)),
++                                 bridgeAvailable: source.tunnelSend != nil)
++    }
++
++    private func push(_ m: CompanionMessage) {
++        guard let s = session, s.activationState == .activated, s.isPaired, s.isWatchAppInstalled else { return }
++        if s.isReachable { s.sendMessage(m.encodeToDictionary(), replyHandler: nil, errorHandler: nil) }
++        scheduleContextUpdate()
++    }
++
++    /// applicationContext is coalesced by the system; update at most every 5 s.
++    private func scheduleContextUpdate() {
++        guard contextTimer == nil else { return }
++        contextTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: false) { [weak self] _ in
++            MainActor.assumeIsolated {
++                guard let self = self else { return }
++                self.contextTimer = nil
++                try? self.session?.updateApplicationContext(CompanionMessage.snapshot(self.snapshot()).encodeToDictionary())
++            }
++        }
++    }
++
++    private func handle(_ m: CompanionMessage) {
++        switch m {
++        case .requestSnapshot:
++            push(.snapshot(snapshot()))
++        case .sendRoom(let c, let text, let clientID):
++            let sent: UnifiedMessage? = c.network == .channel ? channels.send(text, idHex: c.key) : source.sendPublic(text)
++            push(.delivery(messageID: clientID, state: sent == nil ? .failed : .sent))
++        case .sendDirect(let peer, let text, let clientID):
++            let sent = source.sendPrivate(text, peerKey: peer)
++            push(.delivery(messageID: clientID, state: sent == nil ? .failed : .sent))
++        case .joinChannel(let code, let bridge):
++            if channels.join(code: code, bridge: bridge) == nil { push(.error("channel code too short")) }
++        case .leaveChannel(let id): channels.leave(idHex: id)
++        case .setChannelBridge(let id, let on): channels.setBridge(idHex: id, enabled: on)
++        case .toggleFavorite(let peer): source.toggleFavorite(peerKey: peer)
++        default: break
++        }
++    }
++}
++
++extension WatchBridgeHub: WCSessionDelegate {
++    nonisolated func session(_ session: WCSession, activationDidCompleteWith state: WCSessionActivationState, error: Error?) {
++        Task { @MainActor in self.scheduleContextUpdate() }
++    }
++    nonisolated func sessionDidBecomeInactive(_ session: WCSession) {}
++    nonisolated func sessionDidDeactivate(_ session: WCSession) { session.activate() } // watch switched
++    nonisolated func sessionReachabilityDidChange(_ session: WCSession) {
++        guard session.isReachable else { return }
++        Task { @MainActor in self.push(.snapshot(self.snapshot())) }
++    }
++    nonisolated func session(_ session: WCSession, didReceiveMessage message: [String: Any]) {
++        guard let m = CompanionMessage.decode(fromDictionary: message) else { return }
++        Task { @MainActor in self.handle(m) }
++    }
++    nonisolated func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
++        guard let m = CompanionMessage.decode(fromDictionary: userInfo) else { return }
++        Task { @MainActor in self.handle(m) }
++    }
++}
+diff --git a/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/WatchBridgePublic.swift b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/WatchBridgePublic.swift
+new file mode 100644
+index 0000000..2c127f3
+--- /dev/null
++++ b/localPackages/WatchBridgeKit/Sources/WatchBridgeKit/WatchBridgePublic.swift
+@@ -0,0 +1,100 @@
++//
++// WatchBridgePublic.swift — public façade of the WatchBridgeKit package
++//
++// Only this file is public. It lets the upstream bitchat iOS app (which has
++// its own ConversationID, TransportConfig, SecureLogger, … types) use the
++// bridge without any symbol collisions: everything else in the package is
++// internal. Used only when building the upstream patch (scripts/make-upstream-patch.sh);
++// the standalone host target compiles the generic files directly.
++//
++// SPDX-License-Identifier: GPL-3.0-or-later
++//
++
++import Foundation
++
++public struct WBPerson: Equatable {
++    public let key: String          // bitchat peer ID hex
++    public let name: String
++    public let detail: String
++    public let online: Bool
++    public let favorite: Bool
++    public let secure: Bool
++    public init(key: String, name: String, detail: String, online: Bool, favorite: Bool, secure: Bool) {
++        self.key = key; self.name = name; self.detail = detail; self.online = online; self.favorite = favorite; self.secure = secure
++    }
++}
++
++public struct WBMessage: Equatable {
++    public enum State: String { case sending, sent, delivered, read, failed, received }
++    public let id: String
++    /// nil = public mesh room, otherwise the DM peer's ID hex.
++    public let directPeerKey: String?
++    public let senderName: String
++    public let senderKey: String
++    public let text: String
++    public let timestamp: Date
++    public let outgoing: Bool
++    public let state: State
++    public init(id: String, directPeerKey: String?, senderName: String, senderKey: String, text: String,
++                timestamp: Date, outgoing: Bool, state: State) {
++        self.id = id; self.directPeerKey = directPeerKey; self.senderName = senderName; self.senderKey = senderKey
++        self.text = text; self.timestamp = timestamp; self.outgoing = outgoing; self.state = state
++    }
++}
++
++@MainActor
++public protocol WatchBridgeChatSource: AnyObject {
++    var bridgeNickname: String { get }
++    var bridgePeople: [WBPerson] { get }
++    var bridgeRecentMessages: [WBMessage] { get }
++    func bridgeSendPublic(_ text: String) -> WBMessage?
++    func bridgeSendPrivate(_ text: String, peerKey: String) -> WBMessage?
++    func bridgeToggleFavorite(peerKey: String)
++    /// Broadcast an opaque channel-tunnel payload into the mesh (nil = unsupported).
++    var bridgeTunnelSend: ((Data, UInt8) -> Void)? { get }
++}
++
++@MainActor
++public final class WatchBridge {
++    private let adapter: SourceAdapter
++    private let hub: WatchBridgeHub
++
++    public init(source: WatchBridgeChatSource) {
++        adapter = SourceAdapter(source)
++        hub = WatchBridgeHub(source: adapter)
++    }
++
++    public func start() { hub.start() }
++    /// Call for every new mesh/DM message the phone sees (incoming or local echo).
++    public func didReceive(_ m: WBMessage) { adapter.onMessage?(SourceAdapter.convert(m)) }
++    public func peopleDidChange() { adapter.onPeopleChanged?() }
++    /// Call with the payload of every received bitchat packet of type 0x7E.
++    public func didReceiveTunnel(_ payload: Data, fromPeer peer: String) { adapter.onTunnelReceive?(payload, peer) }
++    public static let tunnelPacketType: UInt8 = ChannelTunnelWire.bitchatPacketType
++}
++
++@MainActor
++final class SourceAdapter: CompanionChatSource {
++    let src: WatchBridgeChatSource
++    var onMessage: ((UnifiedMessage) -> Void)?
++    var onPeopleChanged: (() -> Void)?
++    var onTunnelReceive: ((Data, String) -> Void)?
++    init(_ s: WatchBridgeChatSource) { src = s }
++
++    var nickname: String { src.bridgeNickname }
++    var people: [UnifiedPerson] {
++        src.bridgePeople.map { UnifiedPerson(network: .bitchatPhone, key: $0.key, displayName: $0.name, detail: $0.detail,
++                                             isOnline: $0.online, isFavorite: $0.favorite, canMessage: true, secureSession: $0.secure) }
++    }
++    var recentMessages: [UnifiedMessage] { src.bridgeRecentMessages.map(SourceAdapter.convert) }
++    func sendPublic(_ text: String) -> UnifiedMessage? { src.bridgeSendPublic(text).map(SourceAdapter.convert) }
++    func sendPrivate(_ text: String, peerKey: String) -> UnifiedMessage? { src.bridgeSendPrivate(text, peerKey: peerKey).map(SourceAdapter.convert) }
++    func toggleFavorite(peerKey: String) { src.bridgeToggleFavorite(peerKey: peerKey) }
++    var tunnelSend: ((Data, UInt8) -> Void)? { src.bridgeTunnelSend }
++
++    static func convert(_ m: WBMessage) -> UnifiedMessage {
++        UnifiedMessage(id: m.id, conversation: m.directPeerKey.map { .direct(.bitchatPhone, $0) } ?? .room(.bitchatPhone, "public"),
++                       senderName: m.senderName, senderKey: m.senderKey, text: m.text, timestamp: m.timestamp,
++                       outgoing: m.outgoing, state: DeliveryState(rawValue: m.state.rawValue) ?? .received)
++    }
++}

@@ -1,0 +1,78 @@
+# Unsigned CI builds of the watch app, iOS host and Mac tester, plus the Linux
+# protocol/crypto harness. Nothing is signed, archived or published.
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  apple:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode 26
+        run: |
+          XC=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$XC" ]; then echo "No Xcode 26 on this runner image"; ls /Applications; exit 1; fi
+          sudo xcode-select -s "$XC/Contents/Developer"
+          xcodebuild -version
+
+      - name: Ensure watchOS / iOS platforms are present
+        run: |
+          xcodebuild -showsdks
+          xcodebuild -downloadPlatform watchOS || true
+          xcodebuild -downloadPlatform iOS || true
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate project
+        run: xcodegen generate
+
+      - name: Build watchOS app (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild -project BitchatWatch.xcodeproj -scheme BitchatWatch -configuration Debug \
+            -destination 'generic/platform=watchOS' CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            build | tee watch.log | grep -E "error:|warning: .*Swift 6|BUILD (SUCCEEDED|FAILED)" || true
+          grep -q "BUILD SUCCEEDED" watch.log
+
+      - name: Build iOS host (unsigned, embeds watch app)
+        run: |
+          set -o pipefail
+          xcodebuild -project BitchatWatch.xcodeproj -scheme BitchatWatchHost -configuration Debug \
+            -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            build | tee ios.log | grep -E "error:|BUILD (SUCCEEDED|FAILED)" || true
+          grep -q "BUILD SUCCEEDED" ios.log
+
+      - name: Build Mac tester (Xcode project, unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild -project BitchatWatch.xcodeproj -scheme BitchatTester -configuration Release \
+            -destination 'generic/platform=macOS' CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            build | tee mac.log | grep -E "error:|BUILD (SUCCEEDED|FAILED)" || true
+          grep -q "BUILD SUCCEEDED" mac.log
+
+      - name: Build Mac tester (Makefile, the Mojave path)
+        run: make -C MacTester
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apple-build-logs
+          path: "*.log"
+
+  linux:
+    runs-on: ubuntu-latest
+    container: swift:6.0.3-jammy
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux harness (shared core, tester core, interop vectors)
+        run: bash Tests/Linux/build.sh
