@@ -126,7 +126,7 @@ The Swift 5 runtime is part of macOS from **10.14.4**. On 10.14.0–10.14.3 inst
 Support for Command Line Tools* or update to 10.14.6. Apple targets are built in the Swift 5 language mode;
 `Shared/` is also typechecked in Swift 6 mode by the Linux harness (currently clean).
 
-CI (`.github/workflows/build.yml`): macos-15 + Xcode 26 runs XcodeGen and builds all three targets unsigned
+CI (`.github/workflows/build.yml`): macos-15-intel + Xcode 26.x runs XcodeGen and builds all three targets unsigned
 (`CODE_SIGNING_ALLOWED=NO`), plus the Makefile tester build; an Ubuntu job runs the Linux harness in
 `swift:6.0.3`.
 
@@ -174,9 +174,9 @@ To ship the bridge inside the real bitchat iOS app instead of the dev host, see
 
 These have not been tested on real hardware, and some not compiled:
 
-- **Apple builds**: nothing under `WatchApp/`, `Shared/AppleBLE/`, `iOSBridge/` or `MacTester/Sources/App/` has
-  been compiled here (no macOS in the build environment). The pure-Swift core (`Shared/` minus Apple
-  frameworks, `MacTester/Sources/Core`) is compiled and tested on Linux. First CI run on macOS is the real check.
+- **Apple builds**: all three targets now compile in CI (Xcode 26.3, watchOS/iOS 26.2 SDKs: watch app
+  arm64 + arm64_32 at watchOS 26.0, iOS host embedding it, Mac tester x86_64 + arm64 at 10.14, plus the
+  Makefile x86_64 10.14 build). Compiling is all CI proves: none of it has run on a watch, iPhone or Mac.
 - **Mac tester on an actual Mojave machine** with Xcode 10.3/11 CLT: Swift-5.0 syntax was followed by hand
   and only parse-checked with Swift 6; API availability (10.14) was checked against documentation, not a 10.14 SDK.
 - **Xcode 26 and a 10.14 deployment target** for the tester's Xcode target: may warn or bump the minimum.
